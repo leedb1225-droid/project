@@ -49,7 +49,9 @@ export interface UserProfile {
 // Storage abstraction: Upstash Redis (Vercel) OR File (local)
 // ──────────────────────────────────────────────────────────────
 
-const USE_REDIS = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+const USE_REDIS = !!(REDIS_URL && REDIS_TOKEN);
 
 // --- Redis client (lazy-init, only used in production) ---
 let redisClient: any = null;
@@ -58,8 +60,8 @@ async function getRedis() {
   if (!redisClient && USE_REDIS) {
     const { Redis } = await import('@upstash/redis');
     redisClient = new Redis({
-      url: process.env.UPSTASH_REDIS_REST_URL!,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+      url: REDIS_URL!,
+      token: REDIS_TOKEN!,
     });
   }
   return redisClient;
