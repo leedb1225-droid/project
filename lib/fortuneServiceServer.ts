@@ -39,26 +39,47 @@ export interface UserProfile {
   name: string;
   phone?: string | null;
   avatar_url?: string | null;
-  friends: string[];            // 친구들의 email 목록
-  friendWarmth?: Record<string, number>; // 친구별 마음 온도 매핑
-  incomingRequests: string[];   // 친구 요청을 보낸 이들의 email 목록
-  outgoingRequests: string[];   // 친구 요청을 받은 이들의 email 목록
+  friends: string[];
+  friendWarmth?: Record<string, number>;
+  incomingRequests: string[];
+  outgoingRequests: string[];
 }
 
 // ──────────────────────────────────────────────────────────────
-// File-based store helpers
+// Storage abstraction: Upstash Redis (Vercel) OR File (local)
 // ──────────────────────────────────────────────────────────────
 
+const USE_REDIS = !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+
+// --- Redis client (lazy-init, only used in production) ---
+let redisClient: any = null;
+
+async function getRedis() {
+  if (!redisClient && USE_REDIS) {
+    const { Redis } = await import('@upstash/redis');
+    redisClient = new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL!,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+    });
+  }
+  return redisClient;
+}
+
+// Redis keys
+const REDIS_MESSAGES_KEY = 'fortune:messages';
+const REDIS_NOTIFICATIONS_KEY = 'fortune:notifications';
+const REDIS_USERS_KEY = 'fortune:users';
+
+// --- File helpers (local dev only) ---
 const MESSAGES_FILE = 'cookies_db.json';
 const NOTIFICATIONS_FILE = 'notifications_db.json';
+const USERS_FILE = 'users_db.json';
 
 function getFilePath(filename: string) {
-  return path.join(/*turbopackIgnore: true*/ process.cwd(), filename);
+  return path.join(process.cwd(), filename);
 }
 
-// --- Messages ---
-
-let memoryStore: FortuneMessage[] = [
+const SEED_MESSAGES: FortuneMessage[] = [
   {
     id: 'fortune-mock-1',
     message_content: '새로운 바람이 불어오고 있어요. 당신의 도전을 응원합니다!',
@@ -67,9 +88,9 @@ let memoryStore: FortuneMessage[] = [
     coupon_type: 'coffee',
     payment_status: 'paid',
     is_opened: true,
-    opened_at: new Date().toISOString(),
+    opened_at: new Date(Date.now() - 3600000).toISOString(),
     reply: '따뜻한 격려 감사합니다!',
-    replied_at: new Date().toISOString(),
+    replied_at: new Date(Date.now() - 3600000).toISOString(),
     is_public: true,
     likes: 12,
     created_at: new Date(Date.now() - 86400000).toISOString(),
@@ -82,9 +103,9 @@ let memoryStore: FortuneMessage[] = [
     coupon_type: 'dessert',
     payment_status: 'paid',
     is_opened: true,
-    opened_at: new Date().toISOString(),
+    opened_at: new Date(Date.now() - 3600000).toISOString(),
     reply: '설마 내 옆자리 대리님...?',
-    replied_at: new Date().toISOString(),
+    replied_at: new Date(Date.now() - 3600000).toISOString(),
     is_public: true,
     likes: 42,
     created_at: new Date(Date.now() - 3600000).toISOString(),
@@ -100,85 +121,140 @@ let memoryStore: FortuneMessage[] = [
     is_public: true,
     likes: 27,
     created_at: new Date(Date.now() - 172800000).toISOString(),
-  }
+  },
 ];
 
-function loadMessages() {
+// ── Generic load/save for Redis ──
+
+async function redisGet<T>(key: string): Promise<T | null> {
+  const redis = await getRedis();
+  if (!redis) return null;
+  try {
+    const result = await redis.get(key);
+    return result as T | null;
+  } catch (e) {
+    console.error(`[Redis] get error for key ${key}:`, e);
+    return null;
+  }
+}
+
+async function redisSet(key: string, value: unknown): Promise<void> {
+  const redis = await getRedis();
+  if (!redis) return;
+  try {
+    await redis.set(key, value);
+  } catch (e) {
+    console.error(`[Redis] set error for key ${key}:`, e);
+  }
+}
+
+// ── Messages ──
+
+async function loadMessagesFromFile(): Promise<FortuneMessage[]> {
   const filePath = getFilePath(MESSAGES_FILE);
   try {
     if (fs.existsSync(filePath)) {
-      memoryStore = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
     } else {
-      fs.writeFileSync(filePath, JSON.stringify(memoryStore, null, 2), 'utf-8');
+      fs.writeFileSync(filePath, JSON.stringify(SEED_MESSAGES, null, 2), 'utf-8');
+      return SEED_MESSAGES;
     }
   } catch (err) {
-    console.error('Error loading messages:', err);
+    console.error('Error loading messages from file:', err);
+    return SEED_MESSAGES;
   }
 }
 
-function saveMessages() {
+async function loadMessages(): Promise<FortuneMessage[]> {
+  if (USE_REDIS) {
+    const data = await redisGet<FortuneMessage[]>(REDIS_MESSAGES_KEY);
+    if (!data) {
+      // Seed on first run
+      await redisSet(REDIS_MESSAGES_KEY, SEED_MESSAGES);
+      return SEED_MESSAGES;
+    }
+    return data;
+  }
+  return loadMessagesFromFile();
+}
+
+async function saveMessages(messages: FortuneMessage[]): Promise<void> {
+  if (USE_REDIS) {
+    await redisSet(REDIS_MESSAGES_KEY, messages);
+    return;
+  }
   try {
-    fs.writeFileSync(getFilePath(MESSAGES_FILE), JSON.stringify(memoryStore, null, 2), 'utf-8');
+    fs.writeFileSync(getFilePath(MESSAGES_FILE), JSON.stringify(messages, null, 2), 'utf-8');
   } catch (err) {
-    console.error('Error saving messages:', err);
+    console.error('Error saving messages to file:', err);
   }
 }
 
-// --- Notifications ---
+// ── Notifications ──
 
-let notificationsStore: AppNotification[] = [];
-
-function loadNotifications() {
+async function loadNotifications(): Promise<AppNotification[]> {
+  if (USE_REDIS) {
+    const data = await redisGet<AppNotification[]>(REDIS_NOTIFICATIONS_KEY);
+    return data || [];
+  }
   const filePath = getFilePath(NOTIFICATIONS_FILE);
   try {
     if (fs.existsSync(filePath)) {
-      notificationsStore = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
     } else {
       fs.writeFileSync(filePath, JSON.stringify([], null, 2), 'utf-8');
+      return [];
     }
   } catch (err) {
-    console.error('Error loading notifications:', err);
+    console.error('Error loading notifications from file:', err);
+    return [];
   }
 }
 
-function saveNotifications() {
+async function saveNotifications(notifications: AppNotification[]): Promise<void> {
+  if (USE_REDIS) {
+    await redisSet(REDIS_NOTIFICATIONS_KEY, notifications);
+    return;
+  }
   try {
-    fs.writeFileSync(getFilePath(NOTIFICATIONS_FILE), JSON.stringify(notificationsStore, null, 2), 'utf-8');
+    fs.writeFileSync(getFilePath(NOTIFICATIONS_FILE), JSON.stringify(notifications, null, 2), 'utf-8');
   } catch (err) {
-    console.error('Error saving notifications:', err);
+    console.error('Error saving notifications to file:', err);
   }
 }
 
-// --- Users ---
+// ── Users ──
 
-const USERS_FILE = 'users_db.json';
-let usersStore: UserProfile[] = [];
-
-function loadUsers() {
+async function loadUsers(): Promise<UserProfile[]> {
+  if (USE_REDIS) {
+    const data = await redisGet<UserProfile[]>(REDIS_USERS_KEY);
+    return data || [];
+  }
   const filePath = getFilePath(USERS_FILE);
   try {
     if (fs.existsSync(filePath)) {
-      usersStore = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
     } else {
       fs.writeFileSync(filePath, JSON.stringify([], null, 2), 'utf-8');
+      return [];
     }
   } catch (err) {
-    console.error('Error loading users:', err);
+    console.error('Error loading users from file:', err);
+    return [];
   }
 }
 
-function saveUsers() {
+async function saveUsers(users: UserProfile[]): Promise<void> {
+  if (USE_REDIS) {
+    await redisSet(REDIS_USERS_KEY, users);
+    return;
+  }
   try {
-    fs.writeFileSync(getFilePath(USERS_FILE), JSON.stringify(usersStore, null, 2), 'utf-8');
+    fs.writeFileSync(getFilePath(USERS_FILE), JSON.stringify(users, null, 2), 'utf-8');
   } catch (err) {
-    console.error('Error saving users:', err);
+    console.error('Error saving users to file:', err);
   }
 }
-
-// Initial load
-loadMessages();
-loadNotifications();
-loadUsers();
 
 // ──────────────────────────────────────────────────────────────
 // Service
@@ -186,12 +262,12 @@ loadUsers();
 
 export const fortuneServiceServer = {
   async getMessage(id: string): Promise<FortuneMessage | null> {
-    loadMessages();
-    return memoryStore.find(m => m.id === id) || null;
+    const messages = await loadMessages();
+    return messages.find(m => m.id === id) || null;
   },
 
   async createMessage(params: Omit<FortuneMessage, 'id' | 'payment_status' | 'is_opened' | 'likes' | 'created_at'>): Promise<FortuneMessage> {
-    loadMessages();
+    const messages = await loadMessages();
     const id = 'c_' + Math.random().toString(36).substring(2, 9);
     const newMessage: FortuneMessage = {
       ...params,
@@ -201,67 +277,65 @@ export const fortuneServiceServer = {
       likes: 0,
       created_at: new Date().toISOString(),
     };
-    memoryStore.push(newMessage);
-    saveMessages();
+    messages.push(newMessage);
+    await saveMessages(messages);
     return newMessage;
   },
 
   async markAsPaid(id: string): Promise<boolean> {
-    loadMessages();
-    const message = memoryStore.find(m => m.id === id);
+    const messages = await loadMessages();
+    const message = messages.find(m => m.id === id);
     if (message) {
       message.payment_status = 'paid';
-      saveMessages();
+      await saveMessages(messages);
       return true;
     }
     return false;
   },
 
   async markAsOpened(id: string): Promise<boolean> {
-    const opened_at = new Date().toISOString();
-    loadMessages();
-    const message = memoryStore.find(m => m.id === id);
+    const messages = await loadMessages();
+    const message = messages.find(m => m.id === id);
     if (message) {
       message.is_opened = true;
-      message.opened_at = opened_at;
-      saveMessages();
+      message.opened_at = new Date().toISOString();
+      await saveMessages(messages);
       return true;
     }
     return false;
   },
 
   async saveReply(id: string, reply: string): Promise<boolean> {
-    const replied_at = new Date().toISOString();
-    loadMessages();
-    const message = memoryStore.find(m => m.id === id);
+    const messages = await loadMessages();
+    const message = messages.find(m => m.id === id);
     if (message) {
       message.reply = reply;
-      message.replied_at = replied_at;
-      saveMessages();
+      message.replied_at = new Date().toISOString();
+      await saveMessages(messages);
       return true;
     }
     return false;
   },
 
   async toggleLike(id: string): Promise<number> {
-    loadMessages();
-    const message = memoryStore.find(m => m.id === id);
+    const messages = await loadMessages();
+    const message = messages.find(m => m.id === id);
     if (message) {
       message.likes = (message.likes || 0) + 1;
-      saveMessages();
+      await saveMessages(messages);
       return message.likes;
     }
     return 0;
   },
 
   async getPublicMessages(): Promise<FortuneMessage[]> {
-    loadMessages();
-    return memoryStore
+    const messages = await loadMessages();
+    return messages
       .filter(m => m.payment_status === 'paid' && m.is_public)
       .sort((a, b) => b.likes - a.likes);
   },
 
-  // ── Notification methods (file-based) ──
+  // ── Notifications ──
 
   async createNotification(params: {
     user_email?: string | null;
@@ -271,13 +345,13 @@ export const fortuneServiceServer = {
     coupon_type: string;
     type?: string;
   }): Promise<boolean> {
-    loadNotifications();
+    const notifications = await loadNotifications();
 
     let targetEmail = params.user_email || '';
     if (!targetEmail && params.user_phone) {
-      loadUsers();
+      const users = await loadUsers();
       const normalizedPhone = params.user_phone.replace(/[^0-9]/g, '');
-      const user = usersStore.find(u => u.phone && u.phone.replace(/[^0-9]/g, '') === normalizedPhone);
+      const user = users.find(u => u.phone && u.phone.replace(/[^0-9]/g, '') === normalizedPhone);
       if (user) {
         targetEmail = user.email;
       }
@@ -294,22 +368,22 @@ export const fortuneServiceServer = {
       is_read: false,
       created_at: new Date().toISOString(),
     };
-    notificationsStore.unshift(newNotif);
-    saveNotifications();
+    notifications.unshift(newNotif);
+    await saveNotifications(notifications);
     return true;
   },
 
   async getNotifications(userEmail: string, userPhone?: string | null): Promise<AppNotification[]> {
-    loadNotifications();
+    const notifications = await loadNotifications();
     const normalizedPhone = userPhone ? userPhone.replace(/[^0-9]/g, '') : null;
     let hasChanges = false;
 
-    const userNotifs = notificationsStore.filter(n => {
+    const userNotifs = notifications.filter(n => {
       const emailMatch = n.user_email === userEmail;
       const phoneMatch = normalizedPhone && n.user_phone && n.user_phone.replace(/[^0-9]/g, '') === normalizedPhone;
 
       if (phoneMatch && !emailMatch) {
-        n.user_email = userEmail; // claim it!
+        n.user_email = userEmail;
         hasChanges = true;
       }
 
@@ -317,37 +391,37 @@ export const fortuneServiceServer = {
     });
 
     if (hasChanges) {
-      saveNotifications();
+      await saveNotifications(notifications);
     }
 
     return userNotifs.slice(0, 30);
   },
 
   async markNotificationRead(notificationId: string): Promise<boolean> {
-    loadNotifications();
-    const notif = notificationsStore.find(n => n.id === notificationId);
+    const notifications = await loadNotifications();
+    const notif = notifications.find(n => n.id === notificationId);
     if (notif) {
       notif.is_read = true;
-      saveNotifications();
+      await saveNotifications(notifications);
       return true;
     }
     return false;
   },
 
   async markAllNotificationsRead(userEmail: string): Promise<boolean> {
-    loadNotifications();
-    notificationsStore
+    const notifications = await loadNotifications();
+    notifications
       .filter(n => n.user_email === userEmail && !n.is_read)
       .forEach(n => { n.is_read = true; });
-    saveNotifications();
+    await saveNotifications(notifications);
     return true;
   },
 
   // ── User Profiles ──
 
   async getUserProfile(email: string, defaults?: Partial<UserProfile>): Promise<UserProfile> {
-    loadUsers();
-    let user = usersStore.find(u => u.email.toLowerCase() === email.toLowerCase());
+    const users = await loadUsers();
+    let user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
     if (!user) {
       user = {
         email,
@@ -358,21 +432,20 @@ export const fortuneServiceServer = {
         incomingRequests: [],
         outgoingRequests: [],
       };
-      usersStore.push(user);
-      saveUsers();
+      users.push(user);
+      await saveUsers(users);
     } else {
-      // Keep avatar up-to-date if provided
       if (defaults?.avatar_url && user.avatar_url !== defaults.avatar_url) {
         user.avatar_url = defaults.avatar_url;
-        saveUsers();
+        await saveUsers(users);
       }
     }
     return user;
   },
 
   async updateUserProfile(email: string, params: { name: string; phone?: string | null }): Promise<UserProfile> {
-    loadUsers();
-    let user = usersStore.find(u => u.email.toLowerCase() === email.toLowerCase());
+    const users = await loadUsers();
+    let user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
     if (!user) {
       user = {
         email,
@@ -382,25 +455,25 @@ export const fortuneServiceServer = {
         incomingRequests: [],
         outgoingRequests: [],
       };
-      usersStore.push(user);
+      users.push(user);
     } else {
       user.name = params.name;
       user.phone = params.phone || null;
     }
-    saveUsers();
+    await saveUsers(users);
     return user;
   },
 
   // ── Friends Management ──
 
   async searchUser(query: string): Promise<UserProfile | null> {
-    loadUsers();
+    const users = await loadUsers();
     const cleanQuery = query.trim();
     if (!cleanQuery) return null;
 
     const normalizedQueryPhone = cleanQuery.replace(/[^0-9]/g, '');
 
-    return usersStore.find(u => {
+    return users.find(u => {
       const emailMatch = u.email.toLowerCase() === cleanQuery.toLowerCase();
       const phoneMatch = normalizedQueryPhone && u.phone && u.phone.replace(/[^0-9]/g, '') === normalizedQueryPhone;
       return emailMatch || phoneMatch;
@@ -408,8 +481,8 @@ export const fortuneServiceServer = {
   },
 
   async sendFriendRequest(senderEmail: string, targetQuery: string): Promise<{ success: boolean; error?: string }> {
-    loadUsers();
-    const sender = usersStore.find(u => u.email.toLowerCase() === senderEmail.toLowerCase());
+    const users = await loadUsers();
+    const sender = users.find(u => u.email.toLowerCase() === senderEmail.toLowerCase());
     if (!sender) return { success: false, error: '보내는 사용자를 찾을 수 없습니다.' };
 
     const target = await this.searchUser(targetQuery);
@@ -435,7 +508,6 @@ export const fortuneServiceServer = {
     }
 
     if (sender.incomingRequests.includes(target.email)) {
-      // Mutual accept
       await this.acceptFriendRequest(senderEmail, target.email);
       return { success: true };
     }
@@ -443,14 +515,14 @@ export const fortuneServiceServer = {
     sender.outgoingRequests.push(target.email);
     target.incomingRequests.push(sender.email);
 
-    saveUsers();
+    await saveUsers(users);
     return { success: true };
   },
 
   async acceptFriendRequest(receiverEmail: string, senderEmail: string): Promise<boolean> {
-    loadUsers();
-    const receiver = usersStore.find(u => u.email.toLowerCase() === receiverEmail.toLowerCase());
-    const sender = usersStore.find(u => u.email.toLowerCase() === senderEmail.toLowerCase());
+    const users = await loadUsers();
+    const receiver = users.find(u => u.email.toLowerCase() === receiverEmail.toLowerCase());
+    const sender = users.find(u => u.email.toLowerCase() === senderEmail.toLowerCase());
 
     if (!receiver || !sender) return false;
 
@@ -463,63 +535,61 @@ export const fortuneServiceServer = {
     if (!receiver.friends.includes(sender.email)) receiver.friends.push(sender.email);
     if (!sender.friends.includes(receiver.email)) sender.friends.push(receiver.email);
 
-    // Initialize friendship warmth to 36.5°C
     if (!receiver.friendWarmth) receiver.friendWarmth = {};
     if (!sender.friendWarmth) sender.friendWarmth = {};
     if (receiver.friendWarmth[sender.email] === undefined) receiver.friendWarmth[sender.email] = 36.5;
     if (sender.friendWarmth[receiver.email] === undefined) sender.friendWarmth[receiver.email] = 36.5;
 
-    saveUsers();
+    await saveUsers(users);
     return true;
   },
 
   async declineFriendRequest(receiverEmail: string, senderEmail: string): Promise<boolean> {
-    loadUsers();
-    const receiver = usersStore.find(u => u.email.toLowerCase() === receiverEmail.toLowerCase());
-    const sender = usersStore.find(u => u.email.toLowerCase() === senderEmail.toLowerCase());
+    const users = await loadUsers();
+    const receiver = users.find(u => u.email.toLowerCase() === receiverEmail.toLowerCase());
+    const sender = users.find(u => u.email.toLowerCase() === senderEmail.toLowerCase());
 
     if (!receiver || !sender) return false;
 
     receiver.incomingRequests = (receiver.incomingRequests || []).filter(e => e.toLowerCase() !== senderEmail.toLowerCase());
     sender.outgoingRequests = (sender.outgoingRequests || []).filter(e => e.toLowerCase() !== receiverEmail.toLowerCase());
 
-    saveUsers();
+    await saveUsers(users);
     return true;
   },
 
   async removeFriend(userEmail: string, friendEmail: string): Promise<boolean> {
-    loadUsers();
-    const user = usersStore.find(u => u.email.toLowerCase() === userEmail.toLowerCase());
-    const friend = usersStore.find(u => u.email.toLowerCase() === friendEmail.toLowerCase());
+    const users = await loadUsers();
+    const user = users.find(u => u.email.toLowerCase() === userEmail.toLowerCase());
+    const friend = users.find(u => u.email.toLowerCase() === friendEmail.toLowerCase());
 
     if (!user || !friend) return false;
 
     user.friends = (user.friends || []).filter(e => e.toLowerCase() !== friendEmail.toLowerCase());
     friend.friends = (friend.friends || []).filter(e => e.toLowerCase() !== userEmail.toLowerCase());
 
-    // Clean up warmth records
     if (user.friendWarmth) delete user.friendWarmth[friend.email];
     if (friend.friendWarmth) delete friend.friendWarmth[user.email];
 
-    saveUsers();
+    await saveUsers(users);
     return true;
   },
 
   async getMutualFriends(userEmail: string): Promise<UserProfile[]> {
-    loadUsers();
-    const user = usersStore.find(u => u.email.toLowerCase() === userEmail.toLowerCase());
+    const users = await loadUsers();
+    const user = users.find(u => u.email.toLowerCase() === userEmail.toLowerCase());
     if (!user || !user.friends) return [];
 
-    return usersStore.filter(u => user.friends.includes(u.email));
+    return users.filter(u => user.friends.includes(u.email));
   },
 
   async getReceivedMessages(email: string, phone?: string | null): Promise<FortuneMessage[]> {
-    loadMessages();
+    const messages = await loadMessages();
     const normalizedPhone = phone ? phone.replace(/[^0-9]/g, '') : null;
 
-    return memoryStore
-      .filter(m => 
-        m.payment_status === 'paid' && 
+    return messages
+      .filter(m =>
+        m.payment_status === 'paid' &&
         (
           (m.receiver_email && m.receiver_email.toLowerCase() === email.toLowerCase()) ||
           (normalizedPhone && m.receiver_phone && m.receiver_phone.replace(/[^0-9]/g, '') === normalizedPhone)
@@ -529,19 +599,19 @@ export const fortuneServiceServer = {
   },
 
   async getSentMessages(email: string): Promise<FortuneMessage[]> {
-    loadMessages();
-    return memoryStore
-      .filter(m => 
-        m.payment_status === 'paid' && 
+    const messages = await loadMessages();
+    return messages
+      .filter(m =>
+        m.payment_status === 'paid' &&
         m.sender_email && m.sender_email.toLowerCase() === email.toLowerCase()
       )
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
   },
 
   async increaseWarmth(emailA: string, emailB: string, amount: number): Promise<void> {
-    loadUsers();
-    const userA = usersStore.find(u => u.email.toLowerCase() === emailA.toLowerCase());
-    const userB = usersStore.find(u => u.email.toLowerCase() === emailB.toLowerCase());
+    const users = await loadUsers();
+    const userA = users.find(u => u.email.toLowerCase() === emailA.toLowerCase());
+    const userB = users.find(u => u.email.toLowerCase() === emailB.toLowerCase());
 
     if (userA && userB) {
       if (!userA.friendWarmth) userA.friendWarmth = {};
@@ -549,11 +619,11 @@ export const fortuneServiceServer = {
 
       const currentA = userA.friendWarmth[userB.email] ?? 36.5;
       const newWarmth = Math.min(99.9, Math.max(36.5, currentA + amount));
-      
+
       userA.friendWarmth[userB.email] = Number(newWarmth.toFixed(1));
       userB.friendWarmth[userA.email] = Number(newWarmth.toFixed(1));
 
-      saveUsers();
+      await saveUsers(users);
     }
   },
 };
